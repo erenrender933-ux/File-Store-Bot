@@ -5,11 +5,12 @@ from config import MONGO_URI, MAX_FSUB_CHANNELS
 mongo = AsyncIOMotorClient(MONGO_URI)
 db = mongo["forcesub_bot"]
 
-fsub_col = db["fsub_channels"]     # {_id: channel_id, title, invite_link}
-goal_col = db["goals"]             # {_id: channel_id, goal, count, status}
-settings_col = db["settings"]      # {_id: "start_file", chat_id, message_id}
-deletes_col = db["pending_deletes"]  # {chat_id, file_msg_id, notice_msg_id, due_at, done}
-users_col = db["users"]            # {_id: user_id, joined}
+fsub_col = db["fsub_channels"]       # {_id: channel_id, title, invite_link}
+goal_col = db["goals"]               # {_id: channel_id, goal, count, status}
+settings_col = db["settings"]        # start_file + batch_pending docs
+links_col = db["links"]              # {_id: token, ids: [message ids in DB channel]}
+deletes_col = db["pending_deletes"]  # {chat_id, file_msg_ids, notice_msg_id, token, due_at, done}
+users_col = db["users"]              # {_id: user_id, joined}
 
 
 # ---------- Force-sub channels ----------
@@ -68,7 +69,7 @@ async def complete_goal(chat_id: int):
     await goal_col.update_one({"_id": chat_id}, {"$set": {"status": "completed"}})
 
 
-# ---------- Start file ----------
+# ---------- Single start file (/setfile) ----------
 
 async def set_start_file(chat_id: int, message_id: int):
     await settings_col.update_one(
@@ -82,13 +83,40 @@ async def get_start_file():
     return await settings_col.find_one({"_id": "start_file"})
 
 
+# ---------- Batch links ----------
+
+async def set_batch_pending(owner_id: int, first_id: int):
+    await settings_col.update_one(
+        {"_id": f"batch_{owner_id}"},
+        {"$set": {"first_id": first_id}},
+        upsert=True,
+    )
+
+
+async def get_batch_pending(owner_id: int):
+    return await settings_col.find_one({"_id": f"batch_{owner_id}"})
+
+
+async def clear_batch_pending(owner_id: int):
+    await settings_col.delete_one({"_id": f"batch_{owner_id}"})
+
+
+async def create_link(token: str, ids: list):
+    await links_col.insert_one({"_id": token, "ids": ids})
+
+
+async def get_link(token: str):
+    return await links_col.find_one({"_id": token})
+
+
 # ---------- Auto-delete (persistent) ----------
 
-async def schedule_delete(chat_id: int, file_msg_id: int, notice_msg_id: int, delay: int):
+async def schedule_delete(chat_id: int, file_msg_ids: list, notice_msg_id: int, token: str, delay: int):
     await deletes_col.insert_one({
         "chat_id": chat_id,
-        "file_msg_id": file_msg_id,
+        "file_msg_ids": file_msg_ids,
         "notice_msg_id": notice_msg_id,
+        "token": token,
         "due_at": datetime.now(timezone.utc) + timedelta(seconds=delay),
         "done": False,
     })
