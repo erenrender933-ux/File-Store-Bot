@@ -1,16 +1,22 @@
 import asyncio
 import os
+import secrets
 import sys
 
 from pyrogram import Client, filters, idle
 from pyrogram.types import Message, CallbackQuery
 from pyrogram.errors import ChatAdminRequired, PeerIdInvalid, FloodWait
 
-from config import API_ID, API_HASH, BOT_TOKEN, OWNER_ID, MAX_FSUB_CHANNELS
+from config import (
+    API_ID, API_HASH, BOT_TOKEN, OWNER_ID, DB_CHANNEL_ID,
+    MAX_FSUB_CHANNELS, BATCH_LIMIT,
+)
 from database import (
     add_fsub_channel, remove_fsub_channel, is_fsub_channel,
     get_fsub_channels, get_fsub_count, set_goal, get_goal,
     set_start_file, add_user, get_all_users, get_user_count,
+    set_batch_pending, get_batch_pending, clear_batch_pending,
+    create_link, get_link,
 )
 from forcesub import get_missing_channels, build_join_buttons
 from goal import handle_join_request, progress_text
@@ -31,14 +37,16 @@ HELP_TEXT = (
     "/start - Get the file (join channels first)\n"
     "/help - Show this message\n\n"
     "**Owner**\n"
-    "/setfile - Reply to a file with this to set it\n"
+    "/setfile - Reply to a file with this to set the single start file\n"
+    "Forward first DB msg, then last DB msg - bot batch link generate pannum\n"
+    "/batchcancel - Cancel pending batch\n"
     "/addfsub `<channel_id>` - Add force-sub channel (max 6)\n"
     "/delfsub `<channel_id>` - Remove force-sub channel\n"
     "/fsublist - List force-sub channels\n"
     "/goalset `<channel_id> <goal>` - Set join request goal\n"
     "/goalstatus `<channel_id>` - Check goal progress\n"
     "/users - Total users\n"
-    "/broadcast - Reply to a message to send it to all users\n"
+    "/broadcast - Reply to a message to send to all users\n"
     "/restart - Restart the bot"
 )
 
@@ -49,21 +57,26 @@ HELP_TEXT = (
 async def start_handler(client: Client, message: Message):
     await add_user(message.from_user.id)
 
-    # Auto-delete the /start command message
     try:
         await message.delete()
     except Exception:
         pass
+
+    token = message.command[1] if len(message.command) > 1 else "start"
+
+    if token != "start" and not await get_link(token):
+        return await client.send_message(message.chat.id, "❌ Invalid or expired link.")
 
     missing = await get_missing_channels(client, message.from_user.id)
     if missing:
         await client.send_message(
             message.chat.id,
             "❗ Please join all the channels below, then press **Try Again**.",
-            reply_markup=build_join_buttons(missing),
+            reply_markup=build_join_buttons(missing, token),
         )
         return
-    await send_file_flow(client, message.chat.id)
+
+    await send_file_flow(client, message.chat.id, token)
 
 
 @app.on_message(filters.command("help") & filters.private)
@@ -71,27 +84,29 @@ async def help_handler(client: Client, message: Message):
     await message.reply_text(HELP_TEXT)
 
 
-@app.on_callback_query(filters.regex("^verify$"))
+@app.on_callback_query(filters.regex(r"^verify:"))
 async def verify_handler(client: Client, query: CallbackQuery):
+    token = query.data.split(":", 1)[1]
     missing = await get_missing_channels(client, query.from_user.id)
     if missing:
         await query.answer("You have not joined all channels yet.", show_alert=True)
-        await query.message.edit_reply_markup(build_join_buttons(missing))
+        await query.message.edit_reply_markup(build_join_buttons(missing, token))
         return
     await query.answer()
     await query.message.delete()
-    await send_file_flow(client, query.message.chat.id)
+    await send_file_flow(client, query.message.chat.id, token)
 
 
-@app.on_callback_query(filters.regex("^getfile$"))
+@app.on_callback_query(filters.regex(r"^getfile:"))
 async def getfile_handler(client: Client, query: CallbackQuery):
+    token = query.data.split(":", 1)[1]
     missing = await get_missing_channels(client, query.from_user.id)
     if missing:
         await query.answer("Please join all channels first.", show_alert=True)
         await client.send_message(
             query.message.chat.id,
             "❗ Please join all the channels below, then press **Try Again**.",
-            reply_markup=build_join_buttons(missing),
+            reply_markup=build_join_buttons(missing, token),
         )
         return
     await query.answer()
@@ -99,7 +114,7 @@ async def getfile_handler(client: Client, query: CallbackQuery):
         await query.message.delete()
     except Exception:
         pass
-    await send_file_flow(client, query.message.chat.id)
+    await send_file_flow(client, query.message.chat.id, token)
 
 
 # ---------- Join requests ----------
@@ -109,7 +124,55 @@ async def join_request_handler(client: Client, req):
     await handle_join_request(client, req, OWNER_ID)
 
 
-# ---------- Owner: file ----------
+# ---------- Owner: batch link ----------
+
+@app.on_message(filters.private & is_owner & filters.forwarded)
+async def batch_forward_handler(client: Client, message: Message):
+    src = message.forward_from_chat
+    msg_id = message.forward_from_message_id
+
+    if not src or src.id != DB_CHANNEL_ID or not msg_id:
+        return await message.reply_text(
+            "❌ DB channel-la irundhu forward pannunga (forward source hidden-a irukka koodadhu)."
+        )
+
+    owner = message.from_user.id
+    pending = await get_batch_pending(owner)
+
+    if not pending:
+        await set_batch_pending(owner, msg_id)
+        return await message.reply_text(
+            "✅ First message saved.\nIppo LAST message-ah DB channel-la irundhu forward pannunga."
+        )
+
+    first, last = sorted([pending["first_id"], msg_id])
+    await clear_batch_pending(owner)
+
+    if last - first + 1 > BATCH_LIMIT:
+        return await message.reply_text(f"❌ Batch too big. Max {BATCH_LIMIT} files.")
+
+    msgs = await client.get_messages(DB_CHANNEL_ID, list(range(first, last + 1)))
+    existing = [m.id for m in msgs if m and not m.empty]
+    if not existing:
+        return await message.reply_text("❌ No files found in that range.")
+
+    token = secrets.token_urlsafe(8)
+    await create_link(token, existing)
+
+    me = await client.get_me()
+    link = f"https://t.me/{me.username}?start={token}"
+    await message.reply_text(
+        f"✅ Batch link ready!\n\nFiles: **{len(existing)}**\n\n{link}"
+    )
+
+
+@app.on_message(filters.command("batchcancel") & filters.private & is_owner)
+async def batchcancel_cmd(client: Client, message: Message):
+    await clear_batch_pending(message.from_user.id)
+    await message.reply_text("🗑 Pending batch cancelled.")
+
+
+# ---------- Owner: single file ----------
 
 @app.on_message(filters.command("setfile") & filters.private & is_owner)
 async def setfile_cmd(client: Client, message: Message):
@@ -243,7 +306,7 @@ async def restart_cmd(client: Client, message: Message):
 
 async def main():
     await app.start()
-    asyncio.create_task(sweeper(app))   # background auto-delete worker
+    asyncio.create_task(sweeper(app))
     print("Bot started")
     await idle()
     await app.stop()
