@@ -13,14 +13,13 @@ async def get_missing_channels(client: Client, user_id: int) -> list:
         except UserNotParticipant:
             missing.append(ch)
         except ChatAdminRequired:
-            # Bot is not admin in that channel, skip it
             continue
     return missing
 
 
-def build_join_buttons(missing: list) -> InlineKeyboardMarkup:
+def build_join_buttons(missing: list, token: str = "start") -> InlineKeyboardMarkup:
     rows = []
     for index, ch in enumerate(missing, start=1):
         rows.append([InlineKeyboardButton(f"Join Channel {index}", url=ch["invite_link"])])
-    rows.append([InlineKeyboardButton("🔄 Try Again", callback_data="verify")])
+    rows.append([InlineKeyboardButton("🔄 Try Again", callback_data=f"verify:{token}")])
     return InlineKeyboardMarkup(rows)
