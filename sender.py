@@ -40,7 +40,7 @@ async def resolve_source(token: str):
 
 
 async def send_file_flow(client: Client, chat_id: int, token: str = "start"):
-    wait_msg = await client.send_message(chat_id, "⏳ Please Wait...")
+    wait_msg = await client.send_message(chat_id, "Please Wait..")
 
     from_chat, ids = await resolve_source(token)
     if not ids:
